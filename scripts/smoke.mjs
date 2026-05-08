@@ -79,7 +79,7 @@ try {
   // 2. tools/list
   const tools = await makeRequest('tools/list', {});
   const names = (tools.tools || []).map(t => t.name).sort();
-  const expected = ['deepseek_codegen', 'deepseek_query', 'safebridge_audit'];
+  const expected = ['deepseek_codegen', 'deepseek_query', 'safebridge_audit', 'safebridge_discover'];
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     fail(`expected tools ${JSON.stringify(expected)}, got ${JSON.stringify(names)}`);
   } else {
@@ -105,7 +105,7 @@ try {
     name: 'deepseek_query',
     arguments: {
       prompt: 'smoke test',
-      file_globs: ['tools/safebridge-mcp/README.md'],
+      file_globs: ['README.md'],
       dry_run: true,
     },
   });
@@ -162,7 +162,7 @@ try {
     name: 'deepseek_query',
     arguments: {
       prompt: 'try to leak env',
-      file_globs: ['tools/safebridge-mcp/.env', '**/.env*'],
+      file_globs: ['.env', '**/.env*'],
       dry_run: true,
     },
   });

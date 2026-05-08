@@ -53,15 +53,15 @@ test('redacts JWT', () => {
 // ---------- DB URIs ----------
 
 test('redacts postgres URI with creds', () => {
-  const { text, counts } = redact('DATABASE_URL=postgres://raabet:secretpass@db.host/olp');
+  const { text, counts } = redact('DATABASE_URL=postgres://myuser:secretpass@db.host/mydb');
   assert.ok(!text.includes('secretpass'));
   // Should hit either db_uri_with_creds or secret_assignment
   assert.ok(counts.db_uri_with_creds > 0 || counts.secret_assignment > 0);
 });
 
 test('does NOT redact postgres URI without creds', () => {
-  const { text } = redact('postgres://localhost/olp');
-  assert.match(text, /postgres:\/\/localhost\/olp/);
+  const { text } = redact('postgres://localhost/mydb');
+  assert.match(text, /postgres:\/\/localhost\/mydb/);
 });
 
 // ---------- Bearer tokens ----------

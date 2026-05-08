@@ -152,7 +152,7 @@ async function safeCall({
     appendEvent(config.auditLogPath, 'refused', { tool: toolName, reason: 'no_api_key' });
     return {
       ok: false,
-      error: 'DEEPSEEK_API_KEY not configured. Add it to tools/safebridge-mcp/.env and restart the MCP.',
+      error: 'DEEPSEEK_API_KEY not configured. Add it to .env in the safebridge-mcp directory and restart.',
     };
   }
 
@@ -589,7 +589,7 @@ async function main() {
             ``,
             file_globs?.length
               ? `Requested globs: ${JSON.stringify(file_globs)}`
-              : `Allowlist returned zero files - check tools/safebridge-mcp/config.json.`,
+              : `Allowlist returned zero files - check config.json in the safebridge-mcp directory.`,
             ``,
             `Allowlist patterns:`,
             ...config.allowlist.map(g => `  ${g}`),
@@ -666,7 +666,7 @@ async function main() {
           for (const f of included) {
             const parts = f.rel.split('/');
             // Use top-3 levels for suggestions so they're actionable (e.g.
-            // "server/src/lib/rae" not just "server/src").
+            // "server/src/lib/core" not just "server/src").
             const depth = Math.min(parts.length - 1, 3);
             for (let d = 1; d <= depth; d++) {
               const prefix = parts.slice(0, d).join('/');

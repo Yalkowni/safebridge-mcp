@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Live smoke test - makes ONE real DeepSeek call against the safebridge README.
 // Cost: typically <$0.001 (flash, ~2K input tokens, short response).
-// Reads the API key from tools/safebridge-mcp/.env via the normal config path.
+// Reads the API key from .env via the normal config path.
 
 import { spawn } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
@@ -69,7 +69,7 @@ try {
     name: 'deepseek_query',
     arguments: {
       prompt: 'In one sentence, what does this tool do?',
-      file_globs: ['tools/safebridge-mcp/README.md'],
+      file_globs: ['README.md'],
       max_tokens: 300,
     },
   });

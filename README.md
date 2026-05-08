@@ -138,8 +138,8 @@ Same flow, tuned for code generation. Returns code blocks formatted as `### path
 
 ```jsonc
 {
-  "spec": "Add a Zod validator for the inbound webhook payload at server/src/routes/rc-webhook.ts. Schema: ...",
-  "file_globs": ["server/src/routes/rc-webhook.ts", "server/src/types/rc.ts"],
+  "spec": "Add a Zod validator for the inbound webhook payload at server/src/routes/webhook.ts. Schema: ...",
+  "file_globs": ["server/src/routes/webhook.ts", "server/src/types/payload.ts"],
   "model": "deepseek-v4-pro",                     // default: pro for codegen
   "dry_run": false
 }
@@ -160,11 +160,11 @@ safebridge discover - 47 files matched
 Token estimate: 142,800 / 800,000 cap  [fits]
 
 Files by directory:
-  server/src/lib/rae/  (12 files, ~48,200 tok)
+  server/src/lib/core/  (12 files, ~48,200 tok)
     supervisor/engineMonitor.ts          3,840 tok
 
 Suggestions - common narrowings:
-  server/src/lib/rae/**/*               (12 files, ~48,200 tok)
+  server/src/lib/core/**/*               (12 files, ~48,200 tok)
 ```
 
 Workflow: **discover → query**, not query → hit token cap → discover.

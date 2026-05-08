@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "Privacy-aware MCP server that lets Claude Code query your codebase via DeepSeek with secret redaction, allowlist gating, budget caps, and a tamper-evident audit log.",
   "keywords": ["mcp", "claude", "deepseek", "privacy", "redaction", "llm", "codebase"],
-  "repository": { "type": "git", "url": "https://github.com/your-org/safebridge-mcp.git" },
-  "homepage": "https://github.com/your-org/safebridge-mcp#readme",
+  "repository": { "type": "git", "url": "https://github.com/Yalkowni/safebridge-mcp.git" },
+  "homepage": "https://github.com/Yalkowni/safebridge-mcp#readme",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
