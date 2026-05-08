@@ -1,0 +1,6 @@
+.env
+.env.local
+node_modules/
+*.log
+.safebridge-audit.log
+.safebridge-budget.json

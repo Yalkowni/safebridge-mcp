@@ -1,0 +1,41 @@
+{
+  "_comment": "User-editable safety config. See README.md > Threat model. Globs use forward slashes on all platforms.",
+
+  "allowlist_globs": [
+    "src/**/*.{ts,js,tsx,jsx,mjs,cjs}",
+    "lib/**/*.{ts,js,tsx,jsx,mjs,cjs}",
+    "app/**/*.{ts,js,tsx,jsx,mjs,cjs}",
+    "packages/**/*.{ts,js,tsx,jsx,mjs,cjs}",
+    "server/**/*.{ts,js,mjs,cjs}",
+    "client/**/*.{ts,js,tsx,jsx}",
+    "api/**/*.{ts,js,mjs,cjs}",
+    "**/*.{md,sql,toml,yaml,yml}",
+    "*.{json,md,toml,yaml,yml}"
+  ],
+
+  "denylist_globs": [
+    "**/.env*",
+    "**/*.key",
+    "**/*.pem",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*credential*",
+    "**/*secret*",
+    "**/secrets/**",
+    "**/.git/**",
+    "**/node_modules/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/out/**",
+    "**/coverage/**",
+    "**/*.log",
+    "**/*.lock"
+  ],
+
+  "redaction_patterns": {
+    "_comment": "Built-in patterns are always applied (secrets + PII). Add project-specific extras here.",
+    "custom": []
+  }
+}
