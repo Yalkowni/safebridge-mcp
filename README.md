@@ -78,10 +78,10 @@ tools/safebridge-mcp/
 ## Roadmap
 
 - ✅ **Phase A**: redaction, allowlist, audit log, threat model, tests. No network.
-- ✅ **Phase B**: MCP server, `deepseek_query` and `deepseek_codegen` tools, budget tracker, end-to-end smoke test.
+- ✅ **Phase B**: MCP server, `safebridge_query` and `safebridge_codegen` tools, budget tracker, end-to-end smoke test.
 - ✅ **Phase C**: dry-run mode, reversible pseudonymization, `safebridge_audit` inspection tool.
 - ✅ **Phase D**: `safebridge_discover` pre-flight tool, source-agnostic defaults, PII response warning, public release prep.
-- **Phase E**: multi-provider support (OpenAI, Gemini, Ollama, etc.).
+- ✅ **Phase E**: multi-provider support (OpenAI, Gemini, Ollama, DeepSeek default).
 
 ## Setup
 
@@ -89,8 +89,8 @@ tools/safebridge-mcp/
 cd tools/safebridge-mcp
 npm install
 cp .env.example .env
-# Edit .env and set DEEPSEEK_API_KEY (get one at https://platform.deepseek.com)
-npm run check  # runs unit tests + end-to-end smoke test
+# Edit .env: set SAFEBRIDGE_PROVIDER and the matching API key (see Providers below)
+npm run check  # runs unit tests + smoke test
 ```
 
 Then register the MCP in your Claude Code settings (`.claude/settings.json` or global `~/.claude/settings.json`):
@@ -113,40 +113,59 @@ Then register the MCP in your Claude Code settings (`.claude/settings.json` or g
 
 **Restart Claude Code** for it to pick up the new server.
 
+## Providers
+
+Set `SAFEBRIDGE_PROVIDER` in your `.env` (default: `deepseek`).
+
+| Provider | Key env var | Default scan model | Default reason model |
+|---|---|---|---|
+| `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` | `deepseek-reasoner` |
+| `openai` | `OPENAI_API_KEY` | `gpt-4o-mini` | `gpt-4o` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-2.5-flash` | `gemini-2.5-pro` |
+| `ollama` | *(none)* | `llama3.3` | `llama3.3` |
+
+**Ollama** runs locally — no API key, no cost, no data leaves your machine. Install Ollama and pull a model first:
+```bash
+ollama pull llama3.3
+```
+Then set `SAFEBRIDGE_PROVIDER=ollama` in `.env`. Override `OLLAMA_BASE_URL` if Ollama isn't on `localhost:11434`.
+
+Override the default model per-call with the `model` parameter.
+
 ## Tools exposed to the calling LLM
 
-### `deepseek_query`
-Ask DeepSeek a question about repo files. The MCP reads files matching the configured allowlist (optionally narrowed by `file_globs`), redacts known-shape secrets/PII, and returns DeepSeek's answer (also redacted).
+### `safebridge_query`
+Ask your configured LLM a question about repo files. The MCP reads files matching the configured allowlist (optionally narrowed by `file_globs`), redacts known-shape secrets/PII, and returns the answer (also redacted).
 
 ```jsonc
 {
   "prompt": "Where is org_id sourced from request bodies instead of auth context?",
-  "file_globs": ["server/src/routes/**/*.ts"],   // optional
-  "model": "deepseek-v4-flash",                   // optional, default: flash
-  "max_tokens": 4096,                             // optional, default: 4096
-  "pseudonymize": false,                          // optional - see below
-  "dry_run": false                                // optional - see below
+  "file_globs": ["src/routes/**/*.ts"],   // optional
+  "model": "gpt-4o-mini",                // optional, defaults to provider's scan model
+  "max_tokens": 4096,                    // optional, default: 4096
+  "pseudonymize": false,                 // optional - see below
+  "dry_run": false                       // optional - see below
 }
 ```
 
-**`pseudonymize: true`** — Replaces PII (phones, emails, SSNs) with reversible placeholders (`PHONE_001`, `EMAIL_002`, ...) before sending. The response is unmapped back automatically so you see the real values. Use when you need DeepSeek to reason about specific identifiers (e.g. "trace this customer's flow") without exposing the values. Hard secrets (API keys, JWTs, DB URIs) are still lossy-redacted regardless.
+**`pseudonymize: true`** — Replaces PII (phones, emails, SSNs) with reversible placeholders (`PHONE_001`, `EMAIL_002`, ...) before sending. The response is unmapped back automatically so you see the real values. Use when you need the LLM to reason about specific identifiers (e.g. "trace this customer's flow") without exposing the values. Hard secrets (API keys, JWTs, DB URIs) are still lossy-redacted regardless.
 
-**`dry_run: true`** — Prepare the payload but **do not** call DeepSeek. Returns the redacted/pseudonymized prompt + token estimate + cost estimate. Use for sensitive prompts: dry-run first, eyeball the payload, then call again without `dry_run`. No API key required for dry-run.
+**`dry_run: true`** — Prepare the payload but **do not** call the provider. Returns the redacted/pseudonymized prompt + token estimate + cost estimate. Use for sensitive prompts: dry-run first, eyeball the payload, then call again without `dry_run`. No API key required for dry-run.
 
-### `deepseek_codegen`
+### `safebridge_codegen`
 Same flow, tuned for code generation. Returns code blocks formatted as `### path/to/file` headers + fenced code. **The MCP never writes files** — the calling LLM (Claude) reviews and applies.
 
 ```jsonc
 {
-  "spec": "Add a Zod validator for the inbound webhook payload at server/src/routes/webhook.ts. Schema: ...",
-  "file_globs": ["server/src/routes/webhook.ts", "server/src/types/payload.ts"],
-  "model": "deepseek-v4-pro",                     // default: pro for codegen
+  "spec": "Add a Zod validator for the inbound webhook payload at src/routes/webhook.ts. Schema: ...",
+  "file_globs": ["src/routes/webhook.ts", "src/types/payload.ts"],
+  "model": "gpt-4o",   // optional, defaults to provider's reason model
   "dry_run": false
 }
 ```
 
 ### `safebridge_discover`
-Preview which files would be included for a given glob set, with per-file token estimates. **No DeepSeek call, no API key required, no cost.** Use this before `deepseek_query` to find the right `file_globs` without guessing.
+Preview which files would be included for a given glob set, with per-file token estimates. **No provider call, no API key required, no cost.** Use this before `safebridge_query` to find the right `file_globs` without guessing.
 
 ```jsonc
 { "file_globs": ["server/src/lib/**/*.ts"] }  // omit to see the full allowlist

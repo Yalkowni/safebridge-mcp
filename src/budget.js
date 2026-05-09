@@ -62,12 +62,27 @@ export function recordCost(path, actualCost) {
 }
 
 /**
- * DeepSeek pricing as of 2026-05. Per-million-token rates in USD.
- * Source: https://api-docs.deepseek.com/quick_start/pricing
+ * Per-million-token rates in USD. Used for pre-flight cost estimates and budget tracking.
+ * Unknown model → estimateCost/actualCost return 0 (no budget gate, no cost recorded).
+ * Sources: deepseek.com/pricing, platform.openai.com/docs/pricing, ai.google.dev/pricing
  */
 export const PRICING = Object.freeze({
-  'deepseek-v4-flash': { input_cached: 0.028, input_uncached: 0.14, output: 0.28 },
-  'deepseek-v4-pro':   { input_cached: 0.145, input_uncached: 1.74, output: 3.48 },
+  // DeepSeek (real model IDs as of 2026-05)
+  'deepseek-chat':     { input_cached: 0.028, input_uncached: 0.14,  output: 0.28  },
+  'deepseek-reasoner': { input_cached: 0.145, input_uncached: 1.74,  output: 3.48  },
+  // Legacy aliases kept for backward compat
+  'deepseek-v4-flash': { input_cached: 0.028, input_uncached: 0.14,  output: 0.28  },
+  'deepseek-v4-pro':   { input_cached: 0.145, input_uncached: 1.74,  output: 3.48  },
+  // OpenAI
+  'gpt-4o-mini':       { input_cached: 0.075, input_uncached: 0.15,  output: 0.60  },
+  'gpt-4o':            { input_cached: 1.25,  input_uncached: 2.50,  output: 10.00 },
+  'o3-mini':           { input_cached: 0.55,  input_uncached: 1.10,  output: 4.40  },
+  'o4-mini':           { input_cached: 0.275, input_uncached: 1.10,  output: 4.40  },
+  // Gemini
+  'gemini-2.0-flash':  { input_cached: 0.0,   input_uncached: 0.10,  output: 0.40  },
+  'gemini-2.5-flash':  { input_cached: 0.018, input_uncached: 0.15,  output: 0.60  },
+  'gemini-2.5-pro':    { input_cached: 0.313, input_uncached: 1.25,  output: 10.00 },
+  // Ollama: local, always $0 — any model string returns 0 via the unknown-model fallback
 });
 
 /**

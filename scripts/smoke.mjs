@@ -79,7 +79,7 @@ try {
   // 2. tools/list
   const tools = await makeRequest('tools/list', {});
   const names = (tools.tools || []).map(t => t.name).sort();
-  const expected = ['deepseek_codegen', 'deepseek_query', 'safebridge_audit', 'safebridge_discover'];
+  const expected = ['safebridge_audit', 'safebridge_codegen', 'safebridge_discover', 'safebridge_query'];
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     fail(`expected tools ${JSON.stringify(expected)}, got ${JSON.stringify(names)}`);
   } else {
@@ -88,7 +88,7 @@ try {
 
   // 3. call without API key + no dry_run - expect refusal
   const call = await makeRequest('tools/call', {
-    name: 'deepseek_query',
+    name: 'safebridge_query',
     arguments: { prompt: 'smoke test - no key' },
   });
   const text = call.content?.[0]?.text ?? '';
@@ -102,7 +102,7 @@ try {
 
   // 4. dry_run works WITHOUT an API key (no network call made)
   const dryRun = await makeRequest('tools/call', {
-    name: 'deepseek_query',
+    name: 'safebridge_query',
     arguments: {
       prompt: 'smoke test',
       file_globs: ['README.md'],
@@ -144,7 +144,7 @@ try {
 
   // 7. path-traversal in file_globs - server must reject without reading anything
   const traversal = await makeRequest('tools/call', {
-    name: 'deepseek_query',
+    name: 'safebridge_query',
     arguments: { prompt: 'should not run', file_globs: ['../../../etc/passwd'], dry_run: true },
   });
   const traversalText = traversal.content?.[0]?.text ?? '';
@@ -159,7 +159,7 @@ try {
   // 8. caller asks for a denylisted file directly - must yield zero matches,
   // proving denylist wins over caller-supplied globs.
   const denyAttempt = await makeRequest('tools/call', {
-    name: 'deepseek_query',
+    name: 'safebridge_query',
     arguments: {
       prompt: 'try to leak env',
       file_globs: ['.env', '**/.env*'],

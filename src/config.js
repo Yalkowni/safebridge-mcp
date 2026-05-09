@@ -60,12 +60,23 @@ export function loadConfig({ envPath, configPath } = {}) {
     return { name: p.name, re: new RegExp(p.regex, p.flags ?? 'g') };
   });
 
+  const VALID_PROVIDERS = new Set(['deepseek', 'openai', 'ollama', 'gemini']);
+  const provider = (env.SAFEBRIDGE_PROVIDER || 'deepseek').toLowerCase();
+  if (!VALID_PROVIDERS.has(provider)) {
+    throw new Error(`safebridge: unknown SAFEBRIDGE_PROVIDER "${provider}". Valid: deepseek, openai, ollama, gemini`);
+  }
+
+  const KEY_MAP = { deepseek: 'DEEPSEEK_API_KEY', openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY', ollama: '' };
+  const apiKey = env[KEY_MAP[provider]] || '';
+
   const config = Object.freeze({
     toolDir: TOOL_DIR,
     projectRoot,
     auditLogPath,
     budgetPath,
-    apiKey: env.DEEPSEEK_API_KEY || '',
+    provider,
+    apiKey,
+    ollamaBaseUrl: env.OLLAMA_BASE_URL || 'http://localhost:11434',
     dailyBudgetUsd: parseFloat(env.SAFEBRIDGE_DAILY_BUDGET_USD || '2.00'),
     maxInputTokens: parseInt(env.SAFEBRIDGE_MAX_INPUT_TOKENS || '800000', 10),
     allowlist: Object.freeze([...userCfg.allowlist_globs]),

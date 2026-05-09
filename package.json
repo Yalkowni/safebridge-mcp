@@ -1,6 +1,6 @@
 {
   "name": "safebridge-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Privacy-aware MCP server that lets Claude Code query your codebase via DeepSeek with secret redaction, allowlist gating, budget caps, and a tamper-evident audit log.",
   "keywords": ["mcp", "claude", "deepseek", "privacy", "redaction", "llm", "codebase"],
   "repository": { "type": "git", "url": "https://github.com/Yalkowni/safebridge-mcp.git" },
@@ -10,8 +10,8 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "test": "node --test src/redact.test.js src/allowlist.test.js src/audit.test.js src/budget.test.js src/pseudonym.test.js",
-    "test:watch": "node --test --watch src/redact.test.js src/allowlist.test.js src/audit.test.js src/budget.test.js src/pseudonym.test.js",
+    "test": "node --test src/redact.test.js src/allowlist.test.js src/audit.test.js src/budget.test.js src/pseudonym.test.js src/providers.test.js",
+    "test:watch": "node --test --watch src/redact.test.js src/allowlist.test.js src/audit.test.js src/budget.test.js src/pseudonym.test.js src/providers.test.js",
     "smoke": "node scripts/smoke.mjs",
     "check": "npm test && npm run smoke",
     "start": "node src/index.js",

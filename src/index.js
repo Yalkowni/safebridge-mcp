@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // safebridge-mcp - privacy-aware MCP server.
 //
-// Two tools exposed to the calling LLM:
-//   deepseek_query   - read repo files, ask DeepSeek a question, return answer
-//   deepseek_codegen - read repo files, ask DeepSeek to generate code, return code
+// Tools exposed to the calling LLM:
+//   safebridge_query   - read repo files, ask an LLM a question, return answer
+//   safebridge_codegen - read repo files, ask an LLM to generate code, return code
+//   safebridge_audit   - inspect the append-only audit log
+//   safebridge_discover - pre-flight file/token inspection without an API call
 //
 // Every outbound payload is allowlist-gated, redacted, audit-logged, budget-checked.
 // stdout is reserved for MCP protocol; all logging goes to stderr.
@@ -28,7 +30,7 @@ import {
   actualCost,
   estimateTokens,
 } from './budget.js';
-import { chat } from './deepseek.js';
+import { chat } from './providers.js';
 
 const FILE_SIZE_CAP = 1_000_000; // 1 MB per file
 
@@ -95,32 +97,38 @@ function gatherContext({ matched, customPatterns, mode = 'redact' }) {
   return { blocks, files, totalBytes, totalRedactions, redactionCounts };
 }
 
-/**
- * Resolve the adaptive call profile. DeepSeek defaults thinking ON, which
- * means reasoning tokens silently eat the entire max_tokens budget before any
- * content is emitted (verified empirically — see commit history). For most
- * grep-style audits ("scan" mode) we want flash + thinking-off + a small
- * budget. For genuine reasoning work ("reason" mode) we want pro + thinking-on.
- *
- * Caller-supplied `model` and `maxTokens` always override the profile defaults
- * so power users can dial in.
- */
-function resolveProfile({ mode, model, maxTokens }) {
-  const profiles = {
-    scan: {
-      model: 'deepseek-v4-flash',
-      thinkingEnabled: false,
-      reasoningEffort: undefined,
-      maxTokens: 4096,
-    },
-    reason: {
-      model: 'deepseek-v4-pro',
-      thinkingEnabled: true,
-      reasoningEffort: 'high',
-      maxTokens: 8000,
-    },
-  };
-  const base = profiles[mode] ?? profiles.scan;
+// Provider-specific key env-var names (used in error messages and startup warnings).
+const KEY_ENV_NAMES = {
+  deepseek: 'DEEPSEEK_API_KEY',
+  openai: 'OPENAI_API_KEY',
+  gemini: 'GEMINI_API_KEY',
+  ollama: null, // no key required
+};
+
+// Default models per provider and mode. Caller-supplied model always overrides.
+// DeepSeek: thinking ON eats max_tokens before content — scan mode disables it.
+const PROVIDER_PROFILES = {
+  deepseek: {
+    scan:   { model: 'deepseek-chat',     thinkingEnabled: false, reasoningEffort: undefined, maxTokens: 4096 },
+    reason: { model: 'deepseek-reasoner', thinkingEnabled: true,  reasoningEffort: 'high',    maxTokens: 8000 },
+  },
+  openai: {
+    scan:   { model: 'gpt-4o-mini', thinkingEnabled: false, reasoningEffort: undefined, maxTokens: 4096 },
+    reason: { model: 'gpt-4o',      thinkingEnabled: false, reasoningEffort: undefined, maxTokens: 8000 },
+  },
+  gemini: {
+    scan:   { model: 'gemini-2.5-flash', thinkingEnabled: false, reasoningEffort: undefined, maxTokens: 4096 },
+    reason: { model: 'gemini-2.5-pro',   thinkingEnabled: false, reasoningEffort: undefined, maxTokens: 8000 },
+  },
+  ollama: {
+    scan:   { model: 'llama3.3', thinkingEnabled: false, reasoningEffort: undefined, maxTokens: 4096 },
+    reason: { model: 'llama3.3', thinkingEnabled: false, reasoningEffort: undefined, maxTokens: 8000 },
+  },
+};
+
+function resolveProfile({ provider, mode, model, maxTokens }) {
+  const providerProfiles = PROVIDER_PROFILES[provider] ?? PROVIDER_PROFILES.deepseek;
+  const base = providerProfiles[mode] ?? providerProfiles.scan;
   return {
     model: model ?? base.model,
     thinkingEnabled: base.thinkingEnabled,
@@ -144,15 +152,16 @@ async function safeCall({
   pseudonymizeMode = false,
   dryRun = false,
 }) {
-  const profile = resolveProfile({ mode, model, maxTokens });
+  const profile = resolveProfile({ provider: config.provider, mode, model, maxTokens });
   model = profile.model;
   maxTokens = profile.maxTokens;
-  // Step 0: ensure the API key is configured (unless dry-run).
-  if (!config.apiKey && !dryRun) {
+  // Step 0: ensure the API key is configured (unless dry-run or Ollama, which needs no key).
+  if (!config.apiKey && !dryRun && config.provider !== 'ollama') {
+    const keyName = KEY_ENV_NAMES[config.provider] ?? 'API key';
     appendEvent(config.auditLogPath, 'refused', { tool: toolName, reason: 'no_api_key' });
     return {
       ok: false,
-      error: 'DEEPSEEK_API_KEY not configured. Add it to .env in the safebridge-mcp directory and restart.',
+      error: `${keyName} not configured. Add it to .env in the safebridge-mcp directory and restart.`,
     };
   }
 
@@ -305,11 +314,13 @@ async function safeCall({
     prompt_sha256: promptHash,
   });
 
-  // Step 7: call DeepSeek.
+  // Step 7: call the provider.
   let result;
   try {
     result = await chat({
+      provider: config.provider,
       apiKey: config.apiKey,
+      baseUrl: config.ollamaBaseUrl,
       model,
       messages,
       maxTokens,
@@ -320,11 +331,11 @@ async function safeCall({
   } catch (e) {
     appendEvent(config.auditLogPath, 'error', {
       tool: toolName,
-      step: 'deepseek_call',
+      step: 'provider_call',
       message: String(e.message || e),
       call_start_seq: startEvent.seq,
     });
-    return { ok: false, error: `DeepSeek call failed: ${e.message || e}` };
+    return { ok: false, error: `Provider call failed: ${e.message || e}` };
   }
 
   // Step 8: post-process response.
@@ -402,33 +413,34 @@ async function main() {
     process.exit(1);
   }
 
-  if (!config.apiKey) {
+  if (!config.apiKey && config.provider !== 'ollama') {
     // Don't exit - boot the server and let it return a friendly error per call.
     // This way the calling LLM can see the tools exist but is told to set a key.
-    log('WARNING: DEEPSEEK_API_KEY not set. Tool calls will refuse until set.');
+    const keyName = KEY_ENV_NAMES[config.provider] ?? 'API key';
+    log(`WARNING: ${keyName} not set. Tool calls will refuse until set.`);
   }
 
-  const server = new McpServer({ name: 'safebridge', version: '0.1.0' });
+  const server = new McpServer({ name: 'safebridge', version: '0.2.0' });
 
   server.registerTool(
-    'deepseek_query',
+    'safebridge_query',
     {
-      title: 'DeepSeek Repo Query',
-      description: 'Ask DeepSeek a question about repository files. Reads files from the configured allowlist (optionally narrowed by file_globs), redacts secrets/PII, and returns DeepSeek\'s answer. Use for "where is X used", "how does Y flow", whole-repo summaries, log analysis.',
+      title: 'Safebridge Repo Query',
+      description: 'Ask an LLM a question about repository files. Reads files from the configured allowlist (optionally narrowed by file_globs), redacts secrets/PII, and returns the answer. Use for "where is X used", "how does Y flow", whole-repo summaries, log analysis. Provider is set by SAFEBRIDGE_PROVIDER in .env (deepseek/openai/ollama/gemini).',
       inputSchema: z.object({
         prompt: z.string().min(1).describe('Your question. Be specific.'),
-        file_globs: z.array(z.string()).optional().describe('Optional list of glob patterns to narrow which files are included (e.g. ["server/src/workers/**/*.ts"]). Must intersect the allowlist; cannot bypass denylist.'),
-        mode: z.enum(['scan', 'reason']).optional().describe('"scan" (default): v4-flash, thinking OFF, 4K max_tokens. Use for grep-style audits, lookups, "where is X used", quick summaries. "reason": v4-pro, thinking ON with high reasoning_effort, 8K max_tokens. Use for cross-file architectural reasoning, root-cause analysis, anything where a wrong answer is expensive. DeepSeek defaults thinking ON server-side and silently burns max_tokens on reasoning_tokens — picking "scan" explicitly disables it.'),
-        model: z.enum(['deepseek-v4-flash', 'deepseek-v4-pro']).optional().describe('Override the model picked by mode. Usually leave empty.'),
+        file_globs: z.array(z.string()).optional().describe('Optional list of glob patterns to narrow which files are included (e.g. ["src/workers/**/*.ts"]). Must intersect the allowlist; cannot bypass denylist.'),
+        mode: z.enum(['scan', 'reason']).optional().describe('"scan" (default): fast/cheap model, thinking OFF, 4K max_tokens. Use for grep-style audits, lookups, "where is X used", quick summaries. "reason": capable model with deeper reasoning, 8K max_tokens. Use for cross-file architectural reasoning, root-cause analysis. Default models depend on SAFEBRIDGE_PROVIDER.'),
+        model: z.string().optional().describe('Override the model picked by mode. Usually leave empty and let the provider default apply.'),
         max_tokens: z.number().int().positive().max(8000).optional().describe('Override max_tokens. Defaults: scan=4096, reason=8000.'),
-        pseudonymize: z.boolean().optional().describe('If true, replace PII (phones, emails, SSNs) with reversible placeholders (PHONE_001 etc) before sending. Response is unmapped back automatically. Use when you need DeepSeek to reason about specific identifiers without them seeing the values. Default: false (lossy [REDACTED:pii] replacement).'),
-        dry_run: z.boolean().optional().describe('If true, prepare the payload but DO NOT call DeepSeek. Returns the redacted prompt + token estimate + cost estimate so you can review before spending. Default: false.'),
+        pseudonymize: z.boolean().optional().describe('If true, replace PII (phones, emails, SSNs) with reversible placeholders (PHONE_001 etc) before sending. Response is unmapped back automatically. Default: false (lossy [REDACTED:pii] replacement).'),
+        dry_run: z.boolean().optional().describe('If true, prepare the payload but DO NOT call the provider. Returns the redacted prompt + token estimate + cost estimate so you can review before spending. Default: false.'),
       }),
     },
     async ({ prompt, file_globs, mode, model, max_tokens, pseudonymize, dry_run }) => {
       const r = await safeCall({
         config,
-        toolName: 'deepseek_query',
+        toolName: 'safebridge_query',
         userPrompt: prompt,
         fileGlobs: file_globs,
         systemPrompt: QUERY_SYSTEM_PROMPT,
@@ -446,31 +458,29 @@ async function main() {
   );
 
   server.registerTool(
-    'deepseek_codegen',
+    'safebridge_codegen',
     {
-      title: 'DeepSeek Code Generator',
-      description: 'Ask DeepSeek to generate code from a spec, with repo files as context. Returns code blocks formatted as "### path/to/file" headers + fenced code. The calling LLM applies the code; this tool never writes files. Use for non-critical scaffolding, regex/SQL drafts, test fixtures, mass renames - NOT for engine/worker/auth code.',
+      title: 'Safebridge Code Generator',
+      description: 'Ask an LLM to generate code from a spec, with repo files as context. Returns code blocks formatted as "### path/to/file" headers + fenced code. The calling LLM applies the code; this tool never writes files. Use for non-critical scaffolding, regex/SQL drafts, test fixtures, mass renames - NOT for engine/worker/auth code.',
       inputSchema: z.object({
         spec: z.string().min(1).describe('What to build. Be specific about file paths, function signatures, and behavior.'),
         file_globs: z.array(z.string()).optional().describe('Files to include as context. Defaults to allowlist; usually narrow this.'),
-        mode: z.enum(['scan', 'reason']).optional().describe('"reason" (default for codegen): v4-pro, thinking ON, 8K max_tokens. "scan": v4-flash, thinking OFF, 4K — use only for trivial scaffolding (e.g. boilerplate from a template).'),
-        model: z.enum(['deepseek-v4-flash', 'deepseek-v4-pro']).optional().describe('Override the model picked by mode. Usually leave empty.'),
+        mode: z.enum(['scan', 'reason']).optional().describe('"reason" (default for codegen): capable model with deeper reasoning, 8K max_tokens. "scan": fast/cheap model, thinking OFF, 4K — use only for trivial scaffolding. Default models depend on SAFEBRIDGE_PROVIDER.'),
+        model: z.string().optional().describe('Override the model picked by mode. Usually leave empty and let the provider default apply.'),
         max_tokens: z.number().int().positive().max(8000).optional().describe('Override max_tokens. Defaults: scan=4096, reason=8000.'),
-        dry_run: z.boolean().optional().describe('If true, prepare the payload but DO NOT call DeepSeek. Default: false.'),
+        dry_run: z.boolean().optional().describe('If true, prepare the payload but DO NOT call the provider. Default: false.'),
       }),
     },
     async ({ spec, file_globs, mode, model, max_tokens, dry_run }) => {
       const r = await safeCall({
         config,
-        toolName: 'deepseek_codegen',
+        toolName: 'safebridge_codegen',
         userPrompt: spec,
         fileGlobs: file_globs,
         systemPrompt: CODEGEN_SYSTEM_PROMPT,
         mode: mode ?? 'reason',
         model,
         maxTokens: max_tokens,
-        // Codegen rarely benefits from pseudonymization - the spec drives the
-        // identifiers, not the context. Skipping the flag keeps the schema simpler.
         pseudonymizeMode: false,
         dryRun: dry_run ?? false,
       });
@@ -558,7 +568,7 @@ async function main() {
     'safebridge_discover',
     {
       title: 'Safebridge File Discovery',
-      description: 'Preview which files would be included for a given file_globs set, with per-file token estimates and directory grouping. NO DeepSeek call, NO API key required, NO cost. Use this BEFORE deepseek_query/deepseek_codegen to (a) avoid "input tokens exceeded cap" failures by seeing the size up-front and (b) avoid "no files matched" failures by seeing what the allowlist actually contains. If file_globs is omitted, shows the full allowlist with auto-suggested narrowings.',
+      description: 'Preview which files would be included for a given file_globs set, with per-file token estimates and directory grouping. NO provider call, NO API key required, NO cost. Use this BEFORE safebridge_query/safebridge_codegen to (a) avoid "input tokens exceeded cap" failures by seeing the size up-front and (b) avoid "no files matched" failures by seeing what the allowlist actually contains. If file_globs is omitted, shows the full allowlist with auto-suggested narrowings.',
       inputSchema: z.object({
         file_globs: z.array(z.string()).optional().describe('Optional glob patterns to test (same syntax as deepseek_query). Omit to see the full allowlist.'),
         group_by: z.enum(['dir', 'ext', 'flat']).optional().describe('How to group results. "dir" (default): group by top-2-level directory prefix. "ext": group by file extension. "flat": one line per file, no grouping.'),
@@ -707,7 +717,7 @@ async function main() {
         out.push(``);
         out.push(`Token estimate: ${totalTokens.toLocaleString()} / ${cap.toLocaleString()} cap  [${status}]`);
         if (overCap) {
-          out.push(`  Narrow file_globs before calling deepseek_query - see suggestions below.`);
+          out.push(`  Narrow file_globs before calling safebridge_query - see suggestions below.`);
         }
         out.push(``);
 
@@ -787,7 +797,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`safebridge-mcp v0.1.0 ready. project_root=${config.projectRoot} budget=$${config.dailyBudgetUsd}/day`);
+  log(`safebridge-mcp v0.2.0 ready. provider=${config.provider} project_root=${config.projectRoot} budget=$${config.dailyBudgetUsd}/day`);
 
   const shutdown = (sig) => {
     log(`received ${sig}, shutting down`);
