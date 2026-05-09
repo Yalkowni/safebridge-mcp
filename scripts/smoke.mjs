@@ -79,7 +79,7 @@ try {
   // 2. tools/list
   const tools = await makeRequest('tools/list', {});
   const names = (tools.tools || []).map(t => t.name).sort();
-  const expected = ['safebridge_audit', 'safebridge_codegen', 'safebridge_discover', 'safebridge_query'];
+  const expected = ['safebridge_audit', 'safebridge_codegen', 'safebridge_discover', 'safebridge_index', 'safebridge_query'];
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     fail(`expected tools ${JSON.stringify(expected)}, got ${JSON.stringify(names)}`);
   } else {

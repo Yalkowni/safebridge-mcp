@@ -5,3 +5,4 @@ dist/
 *.log
 .safebridge-audit.log
 .safebridge-budget.json
+.safebridge-index.json

@@ -69,6 +69,23 @@ export function loadConfig({ envPath, configPath } = {}) {
   const KEY_MAP = { deepseek: 'DEEPSEEK_API_KEY', openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY', ollama: '' };
   const apiKey = env[KEY_MAP[provider]] || '';
 
+  // Embed provider is optional — semantic retrieval is disabled unless set.
+  const VALID_EMBED_PROVIDERS = new Set(['openai', 'ollama', 'gemini']);
+  const embedProvider = env.SAFEBRIDGE_EMBED_PROVIDER
+    ? env.SAFEBRIDGE_EMBED_PROVIDER.toLowerCase()
+    : null;
+  if (embedProvider && !VALID_EMBED_PROVIDERS.has(embedProvider)) {
+    throw new Error(`safebridge: unknown SAFEBRIDGE_EMBED_PROVIDER "${embedProvider}". Valid: openai, ollama, gemini`);
+  }
+
+  const EMBED_MODEL_DEFAULTS = { openai: 'text-embedding-3-small', ollama: 'nomic-embed-text', gemini: 'text-embedding-004' };
+  const embedModel = env.SAFEBRIDGE_EMBED_MODEL || (embedProvider ? EMBED_MODEL_DEFAULTS[embedProvider] : null);
+
+  const EMBED_KEY_MAP = { openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY', ollama: '' };
+  const embedApiKey = embedProvider ? (env[EMBED_KEY_MAP[embedProvider]] || '') : '';
+
+  const indexPath = env.SAFEBRIDGE_INDEX || join(projectRoot, '.safebridge-index.json');
+
   const config = Object.freeze({
     toolDir: TOOL_DIR,
     projectRoot,
@@ -82,6 +99,10 @@ export function loadConfig({ envPath, configPath } = {}) {
     allowlist: Object.freeze([...userCfg.allowlist_globs]),
     denylist: Object.freeze([...userCfg.denylist_globs]),
     customPatterns: Object.freeze(customPatterns),
+    embedProvider,
+    embedModel,
+    embedApiKey,
+    indexPath,
   });
 
   return config;

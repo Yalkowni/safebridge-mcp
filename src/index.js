@@ -13,7 +13,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, statSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const existsSyncSafe = existsSync;
@@ -31,6 +32,18 @@ import {
   estimateTokens,
 } from './budget.js';
 import { chat } from './providers.js';
+import { chunkText } from './chunker.js';
+import { embedBatch } from './embed.js';
+import {
+  INDEX_VERSION,
+  computeConfigHash,
+  loadIndex,
+  saveIndex,
+  clearIndex,
+  search,
+  fileFingerprint,
+  isStale,
+} from './vector-store.js';
 
 const FILE_SIZE_CAP = 1_000_000; // 1 MB per file
 
@@ -404,6 +417,201 @@ async function safeCall({
   };
 }
 
+const EMBED_BATCH_SIZE = 50;
+
+/**
+ * safebridge_query flow when retrieval:true.
+ * Embeds the query, searches the pre-built vector index, and queries the provider
+ * using only the top-k relevant chunks as context (no full file reads).
+ */
+async function safeCallRetrieval({
+  config,
+  userPrompt,
+  mode,
+  model,
+  maxTokens,
+  topK,
+  dryRun,
+}) {
+  if (!config.embedProvider) {
+    return {
+      ok: false,
+      error: 'Retrieval requires SAFEBRIDGE_EMBED_PROVIDER to be set. Add it to .env (openai / ollama / gemini) then run safebridge_index with action=build.',
+    };
+  }
+
+  const idx = loadIndex(config.indexPath);
+  if (!idx) {
+    return { ok: false, error: 'No semantic index found. Run safebridge_index with action=build first.' };
+  }
+
+  const currentHash = computeConfigHash({
+    allowlist: config.allowlist,
+    denylist: config.denylist,
+    embedProvider: config.embedProvider,
+    embedModel: config.embedModel,
+  });
+  if (idx.configHash !== currentHash) {
+    return { ok: false, error: 'Semantic index is stale (allowlist/denylist/embed settings changed). Run safebridge_index with action=build to rebuild.' };
+  }
+
+  const profile = resolveProfile({ provider: config.provider, mode, model, maxTokens });
+  model = profile.model;
+  maxTokens = profile.maxTokens;
+
+  if (!config.apiKey && !dryRun && config.provider !== 'ollama') {
+    const keyName = KEY_ENV_NAMES[config.provider] ?? 'API key';
+    appendEvent(config.auditLogPath, 'refused', { tool: 'safebridge_query', reason: 'no_api_key' });
+    return { ok: false, error: `${keyName} not configured. Add it to .env and restart.` };
+  }
+
+  const { text: redactedPrompt } = redact(userPrompt, { customPatterns: config.customPatterns });
+
+  let queryVector;
+  try {
+    const embedResult = await embedBatch({
+      provider: config.embedProvider,
+      apiKey: config.embedApiKey,
+      baseUrl: config.ollamaBaseUrl,
+      model: config.embedModel,
+      texts: [redactedPrompt],
+    });
+    queryVector = embedResult.vectors[0];
+  } catch (e) {
+    appendEvent(config.auditLogPath, 'error', { tool: 'safebridge_query', step: 'embed_query', message: String(e.message || e) });
+    return { ok: false, error: `Embedding query failed: ${e.message || e}` };
+  }
+
+  const results = search(queryVector, idx.chunks, { topK, threshold: 0.3 });
+
+  if (results.length === 0) {
+    appendEvent(config.auditLogPath, 'refused', { tool: 'safebridge_query', reason: 'no_chunks_matched', top_k: topK });
+    return { ok: false, error: 'No relevant chunks found (similarity threshold: 0.3). Try a more specific query or rebuild the index with more files.' };
+  }
+
+  const blocks = results.map(r =>
+    `### ${r.path}:${r.startLine}-${r.endLine} (score: ${r.score.toFixed(3)})\n\`\`\`\n${r.redactedText}\n\`\`\``
+  );
+  const userMessage = `Context (${results.length} most relevant chunks from semantic index):\n\n${blocks.join('\n\n')}\n\n---\n\n${redactedPrompt}`;
+
+  const messages = [
+    { role: 'system', content: QUERY_SYSTEM_PROMPT },
+    { role: 'user', content: userMessage },
+  ];
+  const promptHash = sha256(QUERY_SYSTEM_PROMPT + '\n' + userMessage);
+  const inputTokens = estimateTokens(QUERY_SYSTEM_PROMPT) + estimateTokens(userMessage);
+
+  if (inputTokens > config.maxInputTokens) {
+    appendEvent(config.auditLogPath, 'refused', {
+      tool: 'safebridge_query',
+      reason: 'input_tokens_exceeded',
+      estimated_tokens: inputTokens,
+      cap: config.maxInputTokens,
+    });
+    return { ok: false, error: `Estimated input tokens (${inputTokens}) exceeds cap (${config.maxInputTokens}). Reduce top_k.` };
+  }
+
+  const estCost = estimateCost(model, inputTokens, maxTokens);
+
+  if (dryRun) {
+    appendEvent(config.auditLogPath, 'dry_run', {
+      tool: 'safebridge_query',
+      retrieval: true,
+      model,
+      chunk_count: results.length,
+      estimated_input_tokens: inputTokens,
+      estimated_cost_usd: estCost,
+      prompt_sha256: promptHash,
+    });
+    return {
+      ok: true,
+      text: [
+        `[DRY RUN - no API call made]`,
+        `[RETRIEVAL MODE - ${results.length} chunks from semantic index]`,
+        ``,
+        `Would call: ${model}`,
+        `Chunks retrieved: ${results.length} (top_k: ${topK}, threshold: 0.3)`,
+        `Estimated input tokens: ${inputTokens} (cap: ${config.maxInputTokens})`,
+        `Estimated cost: $${estCost.toFixed(4)} (daily cap: $${config.dailyBudgetUsd})`,
+        `Prompt SHA-256: ${promptHash}`,
+        ``,
+        `Top chunks:`,
+        ...results.slice(0, 8).map(r => `  ${r.path}:${r.startLine}-${r.endLine}  score: ${r.score.toFixed(3)}`),
+      ].join('\n'),
+    };
+  }
+
+  const budget = checkBudget(config.budgetPath, config.dailyBudgetUsd, estCost);
+  if (!budget.ok) {
+    appendEvent(config.auditLogPath, 'refused', { tool: 'safebridge_query', reason: 'budget_exceeded', estimated_cost: estCost, spent_today: budget.spent });
+    return { ok: false, error: `Daily budget cap reached. Spent today: $${budget.spent.toFixed(4)} of $${config.dailyBudgetUsd.toFixed(2)}.` };
+  }
+
+  const startEvent = appendEvent(config.auditLogPath, 'call_start', {
+    tool: 'safebridge_query',
+    retrieval: true,
+    model,
+    chunk_count: results.length,
+    estimated_input_tokens: inputTokens,
+    estimated_cost_usd: estCost,
+    prompt_sha256: promptHash,
+  });
+
+  let result;
+  try {
+    result = await chat({
+      provider: config.provider,
+      apiKey: config.apiKey,
+      baseUrl: config.ollamaBaseUrl,
+      model,
+      messages,
+      maxTokens,
+      temperature: 0,
+      thinkingEnabled: profile.thinkingEnabled,
+      reasoningEffort: profile.reasoningEffort,
+    });
+  } catch (e) {
+    appendEvent(config.auditLogPath, 'error', {
+      tool: 'safebridge_query',
+      step: 'provider_call',
+      message: String(e.message || e),
+      call_start_seq: startEvent.seq,
+    });
+    return { ok: false, error: `Provider call failed: ${e.message || e}` };
+  }
+
+  const { text: redactedResponse, total: responseRedactions } = redact(result.content, { categories: ['secret'] });
+  const cost = actualCost(model, result.usage);
+  const newState = recordCost(config.budgetPath, cost);
+
+  appendEvent(config.auditLogPath, 'call_end', {
+    tool: 'safebridge_query',
+    retrieval: true,
+    model: result.model,
+    finish_reason: result.finish_reason,
+    usage: result.usage,
+    cost_usd: cost,
+    response_redactions: responseRedactions,
+    response_sha256: sha256(redactedResponse),
+    daily_spent_after: newState.spent_usd,
+    call_start_seq: startEvent.seq,
+  });
+
+  const metaParts = [
+    `${result.model}`,
+    `retrieval:${results.length} chunks`,
+    `${result.usage?.prompt_tokens ?? '?'}+${result.usage?.completion_tokens ?? '?'} tok`,
+    `$${cost.toFixed(6)}`,
+    `day total $${newState.spent_usd.toFixed(4)} / $${config.dailyBudgetUsd.toFixed(2)}`,
+  ];
+  if (responseRedactions > 0) metaParts.push(`${responseRedactions} response redactions`);
+
+  return {
+    ok: true,
+    text: `${redactedResponse}\n\n[safebridge: ${metaParts.join(' · ')}]`,
+  };
+}
+
 async function main() {
   let config;
   try {
@@ -420,7 +628,7 @@ async function main() {
     log(`WARNING: ${keyName} not set. Tool calls will refuse until set.`);
   }
 
-  const server = new McpServer({ name: 'safebridge', version: '0.2.0' });
+  const server = new McpServer({ name: 'safebridge', version: '0.3.0' });
 
   server.registerTool(
     'safebridge_query',
@@ -433,11 +641,28 @@ async function main() {
         mode: z.enum(['scan', 'reason']).optional().describe('"scan" (default): fast/cheap model, thinking OFF, 4K max_tokens. Use for grep-style audits, lookups, "where is X used", quick summaries. "reason": capable model with deeper reasoning, 8K max_tokens. Use for cross-file architectural reasoning, root-cause analysis. Default models depend on SAFEBRIDGE_PROVIDER.'),
         model: z.string().optional().describe('Override the model picked by mode. Usually leave empty and let the provider default apply.'),
         max_tokens: z.number().int().positive().max(8000).optional().describe('Override max_tokens. Defaults: scan=4096, reason=8000.'),
-        pseudonymize: z.boolean().optional().describe('If true, replace PII (phones, emails, SSNs) with reversible placeholders (PHONE_001 etc) before sending. Response is unmapped back automatically. Default: false (lossy [REDACTED:pii] replacement).'),
+        pseudonymize: z.boolean().optional().describe('If true, replace PII (phones, emails, SSNs) with reversible placeholders (PHONE_001 etc) before sending. Response is unmapped back automatically. Default: false (lossy [REDACTED:pii] replacement). Not applicable when retrieval:true.'),
         dry_run: z.boolean().optional().describe('If true, prepare the payload but DO NOT call the provider. Returns the redacted prompt + token estimate + cost estimate so you can review before spending. Default: false.'),
+        retrieval: z.boolean().optional().describe('If true, use semantic search against a pre-built vector index instead of reading files directly. Requires safebridge_index build to have been run. Use for targeted queries when the full allowlist is too large to fit in context. Default: false.'),
+        top_k: z.number().int().positive().max(100).optional().describe('Number of chunks to retrieve when retrieval:true. Default: 20. Higher values give more context but cost more tokens.'),
       }),
     },
-    async ({ prompt, file_globs, mode, model, max_tokens, pseudonymize, dry_run }) => {
+    async ({ prompt, file_globs, mode, model, max_tokens, pseudonymize, dry_run, retrieval, top_k }) => {
+      if (retrieval) {
+        const r = await safeCallRetrieval({
+          config,
+          userPrompt: prompt,
+          mode: mode ?? 'scan',
+          model,
+          maxTokens: max_tokens,
+          topK: top_k ?? 20,
+          dryRun: dry_run ?? false,
+        });
+        return {
+          content: [{ type: 'text', text: r.ok ? r.text : `[safebridge refused] ${r.error}` }],
+          isError: !r.ok,
+        };
+      }
       const r = await safeCall({
         config,
         toolName: 'safebridge_query',
@@ -795,9 +1020,221 @@ async function main() {
     },
   );
 
+  server.registerTool(
+    'safebridge_index',
+    {
+      title: 'Safebridge Semantic Index',
+      description: 'Build or manage the vector index for semantic retrieval. Requires SAFEBRIDGE_EMBED_PROVIDER in .env. actions: "build" (full rebuild), "update" (re-embed changed files only), "status" (staleness report), "clear" (delete index). After building, use retrieval:true in safebridge_query to search by similarity instead of reading all files.',
+      inputSchema: z.object({
+        action: z.enum(['build', 'update', 'status', 'clear']).describe('build: full rebuild from scratch. update: re-embed only changed files (faster). status: report staleness without making changes. clear: delete the index file.'),
+        file_globs: z.array(z.string()).optional().describe('Optional glob patterns to limit which files are indexed (same rules as safebridge_query). Omit to index the full allowlist.'),
+      }),
+    },
+    async ({ action, file_globs }) => {
+      if (!config.embedProvider) {
+        return {
+          content: [{ type: 'text', text: '[safebridge refused] SAFEBRIDGE_EMBED_PROVIDER not set. Add it to .env (openai / ollama / gemini) to use semantic retrieval.' }],
+          isError: true,
+        };
+      }
+
+      try {
+        // ---- clear ----
+        if (action === 'clear') {
+          clearIndex(config.indexPath);
+          appendEvent(config.auditLogPath, 'index_clear', { tool: 'safebridge_index' });
+          return { content: [{ type: 'text', text: `Index cleared: ${config.indexPath}` }] };
+        }
+
+        // ---- status ----
+        if (action === 'status') {
+          const idx = loadIndex(config.indexPath);
+          if (!idx) {
+            return { content: [{ type: 'text', text: 'No index found. Run safebridge_index with action=build.' }] };
+          }
+          const currentHash = computeConfigHash({
+            allowlist: config.allowlist,
+            denylist: config.denylist,
+            embedProvider: config.embedProvider,
+            embedModel: config.embedModel,
+          });
+          const configStale = idx.configHash !== currentHash;
+
+          let staleCount = 0;
+          const stalePaths = [];
+          for (const [relPath, stored] of Object.entries(idx.files)) {
+            const abs = join(config.projectRoot, relPath);
+            try {
+              const buf = readFileSync(abs);
+              const stat = statSync(abs);
+              if (isStale(stored, fileFingerprint(buf, stat.mtimeMs))) {
+                staleCount++;
+                if (stalePaths.length < 10) stalePaths.push(relPath);
+              }
+            } catch {
+              staleCount++;
+              if (stalePaths.length < 10) stalePaths.push(`${relPath} (deleted/unreadable)`);
+            }
+          }
+
+          const lines = [
+            `safebridge index status`,
+            `  Provider:      ${idx.embedProvider} / ${idx.embedModel}`,
+            `  Dimensions:    ${idx.dims}`,
+            `  Files indexed: ${Object.keys(idx.files).length}`,
+            `  Chunks:        ${idx.chunks.length}`,
+            `  Created:       ${idx.created}`,
+            `  Updated:       ${idx.updated}`,
+            `  Config hash:   ${configStale ? '⚠ STALE (settings changed — run build)' : 'OK'}`,
+            `  File changes:  ${staleCount === 0 ? 'none' : `${staleCount} stale — run update or build`}`,
+          ];
+          if (stalePaths.length > 0) {
+            lines.push(`  Stale:`);
+            for (const p of stalePaths) lines.push(`    ${p}`);
+          }
+          return { content: [{ type: 'text', text: lines.join('\n') }] };
+        }
+
+        // ---- build / update ----
+        const isUpdate = action === 'update';
+        const existingIndex = isUpdate ? loadIndex(config.indexPath) : null;
+
+        if (isUpdate && !existingIndex) {
+          return { content: [{ type: 'text', text: 'No existing index found. Run build first.' }], isError: true };
+        }
+
+        const configHash = computeConfigHash({
+          allowlist: config.allowlist,
+          denylist: config.denylist,
+          embedProvider: config.embedProvider,
+          embedModel: config.embedModel,
+        });
+
+        if (isUpdate && existingIndex.configHash !== configHash) {
+          return {
+            content: [{ type: 'text', text: 'Index config mismatch (allowlist/embed settings changed). Run build to rebuild from scratch.' }],
+            isError: true,
+          };
+        }
+
+        if (file_globs?.length) validateRequestedGlobs(file_globs);
+        const matched = findFiles({
+          root: config.projectRoot,
+          allowlist: config.allowlist,
+          denylist: config.denylist,
+          requestedGlobs: file_globs?.length ? file_globs : undefined,
+        });
+
+        if (matched.length === 0) {
+          return { content: [{ type: 'text', text: '[safebridge refused] No files matched. Check allowlist in config.json.' }], isError: true };
+        }
+
+        // Collect chunks to embed and fingerprints to keep.
+        const chunksToEmbed = [];
+        const fileRecords = {};
+
+        for (const f of matched) {
+          let buf;
+          try { buf = readFileSync(f.abs); } catch { continue; }
+          if (buf.length > FILE_SIZE_CAP) continue;
+
+          const stat = statSync(f.abs);
+          const fp = fileFingerprint(buf, stat.mtimeMs);
+
+          if (isUpdate && existingIndex.files[f.rel] && !isStale(existingIndex.files[f.rel], fp)) {
+            fileRecords[f.rel] = existingIndex.files[f.rel];
+            continue;
+          }
+
+          const { text: redacted } = redact(buf.toString('utf8'), { customPatterns: config.customPatterns });
+          fileRecords[f.rel] = fp;
+          for (const chunk of chunkText(redacted, f.rel)) {
+            chunksToEmbed.push(chunk);
+          }
+        }
+
+        // Carry over unchanged chunks (update mode only).
+        const changedPaths = new Set(chunksToEmbed.map(c => c.path));
+        const keptChunks = isUpdate
+          ? existingIndex.chunks.filter(c => fileRecords[c.path] && !changedPaths.has(c.path))
+          : [];
+
+        // Embed new/changed chunks in batches.
+        const newEmbeddedChunks = [];
+        for (let i = 0; i < chunksToEmbed.length; i += EMBED_BATCH_SIZE) {
+          const batch = chunksToEmbed.slice(i, i + EMBED_BATCH_SIZE);
+          const embedResult = await embedBatch({
+            provider: config.embedProvider,
+            apiKey: config.embedApiKey,
+            baseUrl: config.ollamaBaseUrl,
+            model: config.embedModel,
+            texts: batch.map(c => c.text),
+          });
+          appendEvent(config.auditLogPath, 'embed_batch', {
+            tool: 'safebridge_index',
+            action,
+            batch_idx: Math.floor(i / EMBED_BATCH_SIZE),
+            chunk_count: batch.length,
+          });
+          for (let j = 0; j < batch.length; j++) {
+            newEmbeddedChunks.push({
+              path: batch[j].path,
+              startLine: batch[j].startLine,
+              endLine: batch[j].endLine,
+              redactedText: batch[j].text,
+              vector: embedResult.vectors[j],
+            });
+          }
+        }
+
+        const allChunks = [...keptChunks, ...newEmbeddedChunks];
+        const now = new Date().toISOString();
+        const index = {
+          version: INDEX_VERSION,
+          configHash,
+          embedProvider: config.embedProvider,
+          embedModel: config.embedModel,
+          dims: allChunks[0]?.vector?.length ?? 0,
+          created: isUpdate ? (existingIndex.created ?? now) : now,
+          updated: now,
+          files: fileRecords,
+          chunks: allChunks,
+        };
+        saveIndex(config.indexPath, index);
+
+        appendEvent(config.auditLogPath, 'index_build', {
+          tool: 'safebridge_index',
+          action,
+          files: Object.keys(fileRecords).length,
+          new_chunks: newEmbeddedChunks.length,
+          kept_chunks: keptChunks.length,
+          total_chunks: allChunks.length,
+          dims: index.dims,
+        });
+
+        const lines = [
+          `safebridge index ${action} complete`,
+          `  Provider: ${config.embedProvider} / ${config.embedModel}`,
+          `  Files:    ${Object.keys(fileRecords).length} indexed`,
+          `  Chunks:   ${allChunks.length} total (${newEmbeddedChunks.length} new, ${keptChunks.length} kept)`,
+          `  Dims:     ${index.dims}`,
+          `  Saved to: ${config.indexPath}`,
+        ];
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } catch (e) {
+        log('safebridge_index error:', e.message || e);
+        appendEvent(config.auditLogPath, 'error', { tool: 'safebridge_index', message: String(e.message || e) });
+        return {
+          content: [{ type: 'text', text: `safebridge index failed: ${e.message || e}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`safebridge-mcp v0.2.0 ready. provider=${config.provider} project_root=${config.projectRoot} budget=$${config.dailyBudgetUsd}/day`);
+  log(`safebridge-mcp v0.3.0 ready. provider=${config.provider} embed=${config.embedProvider ?? 'none'} project_root=${config.projectRoot} budget=$${config.dailyBudgetUsd}/day`);
 
   const shutdown = (sig) => {
     log(`received ${sig}, shutting down`);

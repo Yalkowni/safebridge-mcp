@@ -83,6 +83,8 @@ export const PRICING = Object.freeze({
   'gemini-2.5-flash':  { input_cached: 0.018, input_uncached: 0.15,  output: 0.60  },
   'gemini-2.5-pro':    { input_cached: 0.313, input_uncached: 1.25,  output: 10.00 },
   // Ollama: local, always $0 — any model string returns 0 via the unknown-model fallback
+  // Embedding models (openai/gemini/ollama) return 0 via the unknown-model fallback;
+  // embedding costs are negligible and tracked separately in the audit log.
 });
 
 /**

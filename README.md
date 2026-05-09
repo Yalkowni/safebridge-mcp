@@ -82,6 +82,7 @@ tools/safebridge-mcp/
 - ✅ **Phase C**: dry-run mode, reversible pseudonymization, `safebridge_audit` inspection tool.
 - ✅ **Phase D**: `safebridge_discover` pre-flight tool, source-agnostic defaults, PII response warning, public release prep.
 - ✅ **Phase E**: multi-provider support (OpenAI, Gemini, Ollama, DeepSeek default).
+- ✅ **Phase F**: semantic retrieval (RAG) — vector index of the codebase, query by similarity.
 
 ## Setup
 
@@ -132,6 +133,37 @@ Then set `SAFEBRIDGE_PROVIDER=ollama` in `.env`. Override `OLLAMA_BASE_URL` if O
 
 Override the default model per-call with the `model` parameter.
 
+## Semantic Retrieval (RAG)
+
+When your codebase is too large to fit in context, build a vector index and query by similarity instead of loading all files.
+
+**Setup** (in `.env`):
+```bash
+SAFEBRIDGE_EMBED_PROVIDER=openai       # or ollama, gemini
+OPENAI_API_KEY=sk-...                  # whichever key the embed provider needs
+```
+
+| Embed provider | Key env var | Default model | Dimensions |
+|---|---|---|---|
+| `openai` | `OPENAI_API_KEY` | `text-embedding-3-small` | 1536 |
+| `ollama` | *(none)* | `nomic-embed-text` | 768 |
+| `gemini` | `GEMINI_API_KEY` | `text-embedding-004` | 768 |
+
+**Build the index** (one-time, then update as files change):
+```bash
+# via safebridge_index tool in the chat:
+safebridge_index action=build
+# incremental after file changes:
+safebridge_index action=update
+```
+
+**Query with retrieval:**
+```jsonc
+{ "prompt": "Where does the auth middleware validate JWTs?", "retrieval": true, "top_k": 20 }
+```
+
+**Security:** redaction runs at index-build time. Chunks stored in `.safebridge-index.json` contain already-redacted text. The query is also redacted before being sent to the embedding API.
+
 ## Tools exposed to the calling LLM
 
 ### `safebridge_query`
@@ -144,13 +176,17 @@ Ask your configured LLM a question about repo files. The MCP reads files matchin
   "model": "gpt-4o-mini",                // optional, defaults to provider's scan model
   "max_tokens": 4096,                    // optional, default: 4096
   "pseudonymize": false,                 // optional - see below
-  "dry_run": false                       // optional - see below
+  "dry_run": false,                      // optional - see below
+  "retrieval": false,                    // optional - see below
+  "top_k": 20                            // optional, only with retrieval:true
 }
 ```
 
 **`pseudonymize: true`** — Replaces PII (phones, emails, SSNs) with reversible placeholders (`PHONE_001`, `EMAIL_002`, ...) before sending. The response is unmapped back automatically so you see the real values. Use when you need the LLM to reason about specific identifiers (e.g. "trace this customer's flow") without exposing the values. Hard secrets (API keys, JWTs, DB URIs) are still lossy-redacted regardless.
 
 **`dry_run: true`** — Prepare the payload but **do not** call the provider. Returns the redacted/pseudonymized prompt + token estimate + cost estimate. Use for sensitive prompts: dry-run first, eyeball the payload, then call again without `dry_run`. No API key required for dry-run.
+
+**`retrieval: true`** — Instead of reading all matched files, embed the query and retrieve the `top_k` most relevant chunks from a pre-built vector index. Requires `SAFEBRIDGE_EMBED_PROVIDER` in `.env` and `safebridge_index build` to have been run. Best for targeted lookups on large allowlists that would exceed the token cap with full-file reads. Redaction is applied at index-build time; chunks are stored pre-redacted.
 
 ### `safebridge_codegen`
 Same flow, tuned for code generation. Returns code blocks formatted as `### path/to/file` headers + fenced code. **The MCP never writes files** — the calling LLM (Claude) reviews and applies.
@@ -163,6 +199,21 @@ Same flow, tuned for code generation. Returns code blocks formatted as `### path
   "dry_run": false
 }
 ```
+
+### `safebridge_index`
+Build or manage the vector index for semantic retrieval.
+
+```jsonc
+{ "action": "build"  }               // full rebuild from the allowlist
+{ "action": "update" }               // re-embed only changed files (incremental)
+{ "action": "status" }               // staleness report (no embed calls)
+{ "action": "clear"  }               // delete the index file
+{ "action": "build", "file_globs": ["server/src/**/*.ts"] }  // index a subset
+```
+
+Requires `SAFEBRIDGE_EMBED_PROVIDER` in `.env` (and the matching API key). Once built, pass `retrieval: true` to `safebridge_query` to search by similarity instead of reading all files.
+
+**Workflow:** discover → query (normal) or index build → query (retrieval)
 
 ### `safebridge_discover`
 Preview which files would be included for a given glob set, with per-file token estimates. **No provider call, no API key required, no cost.** Use this before `safebridge_query` to find the right `file_globs` without guessing.
@@ -228,6 +279,7 @@ Add these to your project's `.gitignore`:
 # safebridge runtime files — not secrets, but not useful in git history
 .safebridge-audit.log
 .safebridge-budget.json
+.safebridge-index.json
 ```
 
 The `.env` file is already excluded by safebridge-mcp's own `.gitignore` inside the tool directory.
