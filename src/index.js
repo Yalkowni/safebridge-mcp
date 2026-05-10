@@ -151,6 +151,93 @@ function resolveProfile({ provider, mode, model, maxTokens }) {
 }
 
 /**
+ * Quick per-file token scan. Reads each file once to estimate tokens before
+ * deciding whether chunking is needed. Files over FILE_SIZE_CAP are marked
+ * oversized (gatherContext skips them anyway).
+ */
+function estimateFileTokens(matched) {
+  return matched.map(f => {
+    try {
+      const buf = readFileSync(f.abs);
+      if (buf.length > FILE_SIZE_CAP) return { file: f, tokens: 0, oversized: true };
+      return { file: f, tokens: estimateTokens(buf.toString('utf8')), oversized: false };
+    } catch {
+      return { file: f, tokens: 0, oversized: true };
+    }
+  });
+}
+
+/**
+ * Greedy bin-packing: split filesWithTokens into batches where each batch
+ * fits under batchLimit tokens. Files individually over batchLimit are placed
+ * in their own batch (the inner safeCall token check will catch them).
+ */
+function packBatches(filesWithTokens, batchLimit) {
+  const batches = [];
+  let current = [];
+  let currentTokens = 0;
+  for (const entry of filesWithTokens) {
+    if (entry.oversized) continue;
+    if (current.length > 0 && currentTokens + entry.tokens > batchLimit) {
+      batches.push(current);
+      current = [];
+      currentTokens = 0;
+    }
+    current.push(entry);
+    currentTokens += entry.tokens;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/**
+ * Auto-chunked version of safeCall. Fires one safeCall per batch in parallel
+ * (scan mode) or sequentially (reason mode), then concatenates results.
+ * Called automatically when the matched file set exceeds maxInputTokens.
+ */
+async function safeCallChunked({
+  config, toolName, userPrompt, systemPrompt, mode, model, maxTokens,
+  pseudonymizeMode, dryRun, filesWithTokens, batchLimit,
+}) {
+  const batches = packBatches(filesWithTokens, batchLimit);
+  const oversizedCount = filesWithTokens.filter(x => x.oversized).length;
+  const totalFiles = filesWithTokens.filter(x => !x.oversized).length;
+
+  if (batches.length === 0) {
+    appendEvent(config.auditLogPath, 'refused', { tool: toolName, reason: 'no_files_fit_after_chunking' });
+    return { ok: false, error: 'No files fit within the token cap after chunking. All matched files may be oversized or unreadable.' };
+  }
+
+  appendEvent(config.auditLogPath, 'chunked_call_start', {
+    tool: toolName, batch_count: batches.length, total_files: totalFiles,
+    oversized_skipped: oversizedCount, dry_run: dryRun,
+  });
+  log(`auto-chunking ${totalFiles} files into ${batches.length} batch(es)`);
+
+  const runBatch = (batch, idx) => safeCall({
+    config, toolName, userPrompt, fileGlobs: undefined, systemPrompt,
+    mode, model, maxTokens, pseudonymizeMode, dryRun,
+    _fileSubset: batch.map(x => x.file),
+  }).then(result => ({ idx: idx + 1, total: batches.length, fileCount: batch.length, result }));
+
+  const batchResults = mode === 'reason'
+    ? await batches.reduce(async (acc, batch, i) => { const prev = await acc; prev.push(await runBatch(batch, i)); return prev; }, Promise.resolve([]))
+    : await Promise.all(batches.map((batch, i) => runBatch(batch, i)));
+
+  const parts = [
+    `[safebridge: auto-chunked into ${batches.length} batch(es), ${totalFiles} files total${oversizedCount > 0 ? `, ${oversizedCount} oversized skipped` : ''}]`,
+    '',
+  ];
+  for (const { idx, total, fileCount, result } of batchResults) {
+    parts.push(`=== Batch ${idx}/${total} (${fileCount} files) ===`);
+    parts.push(result.ok ? result.text : `[batch failed: ${result.error}]`);
+    parts.push('');
+  }
+
+  return { ok: batchResults.some(b => b.result.ok), text: parts.join('\n') };
+}
+
+/**
  * Run the full safe-call flow. Shared between deepseek_query and deepseek_codegen.
  */
 async function safeCall({
@@ -164,6 +251,7 @@ async function safeCall({
   maxTokens,
   pseudonymizeMode = false,
   dryRun = false,
+  _fileSubset = null, // internal: skip findFiles, use this array directly (chunking sentinel)
 }) {
   const profile = resolveProfile({ provider: config.provider, mode, model, maxTokens });
   model = profile.model;
@@ -179,10 +267,11 @@ async function safeCall({
   }
 
   // Step 1: validate globs (defense against path traversal in caller-supplied input).
-  if (fileGlobs?.length) validateRequestedGlobs(fileGlobs);
+  if (!_fileSubset && fileGlobs?.length) validateRequestedGlobs(fileGlobs);
 
   // Step 2: find files via allowlist + denylist (+ optional caller narrowing).
-  const matched = findFiles({
+  // When _fileSubset is set we're inside a chunked batch — skip findFiles.
+  const matched = _fileSubset ?? findFiles({
     root: config.projectRoot,
     allowlist: config.allowlist,
     denylist: config.denylist,
@@ -203,6 +292,21 @@ async function safeCall({
           : 'Allowlist returned zero files - check config.json.'
       }`,
     };
+  }
+
+  // Step 2.5: auto-chunk if the file set won't fit in a single call.
+  // Only runs on the outer call (_fileSubset null) — prevents infinite recursion.
+  if (!_fileSubset) {
+    const promptOverhead = estimateTokens(systemPrompt) + estimateTokens(userPrompt) + 1000;
+    const batchLimit = Math.max(config.maxInputTokens - promptOverhead, 50_000);
+    const filesWithTokens = estimateFileTokens(matched);
+    const totalEstimate = promptOverhead + filesWithTokens.filter(x => !x.oversized).reduce((s, x) => s + x.tokens, 0);
+    if (totalEstimate > config.maxInputTokens) {
+      return safeCallChunked({
+        config, toolName, userPrompt, systemPrompt, mode, model, maxTokens,
+        pseudonymizeMode, dryRun, filesWithTokens, batchLimit,
+      });
+    }
   }
 
   // Step 3: read + scrub. In pseudonymize mode we strip secrets per-file but
